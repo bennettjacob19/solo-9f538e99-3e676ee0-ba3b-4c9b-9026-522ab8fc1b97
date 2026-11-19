@@ -519,6 +519,12 @@ class DirectoryStore:
         if hook is not None:
             hook(payload)
 
+    def register_hook(self, name: str, hook: Callable[[dict], None]) -> None:
+        """Register (or replace) a post-commit hook such as
+        ``after_version_commit`` (fired after any committed directory change
+        with ``{"version": <new committed version>, ...}``)."""
+        self._hooks[name] = hook
+
     # -- public reads -----------------------------------------------------
 
     def resolve(self, name: str | None = None) -> dict:
@@ -579,6 +585,39 @@ class DirectoryStore:
         with self._txn(write=False) as conn:
             conn.execute("SELECT 1")
 
+    def current_version_id(self) -> int:
+        """The currently published (committed) directory version id."""
+        self._ensure_ready()
+        with self._txn(write=False) as conn:
+            return self._current_version(conn)
+
+    def version_entries(self, version_id: int) -> tuple[tuple[str, str], ...]:
+        """The complete, immutable entry list of one committed version."""
+        self._ensure_ready()
+        with self._txn(write=False) as conn:
+            if conn.execute(
+                "SELECT 1 FROM versions WHERE id=?", (version_id,)
+            ).fetchone() is None:
+                raise NotFoundError(f"未知目录版本: {version_id}")
+            return self._entries(conn, version_id)
+
+    def service_present_in_versions(
+        self, service: str, after_version: int, to_version: int
+    ) -> bool:
+        """True iff ``service`` exists in *every* version in
+        ``(after_version, to_version]`` — the continuity check behind the
+        target-file address-reuse rule."""
+        self._ensure_ready()
+        with self._txn(write=False) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS missing FROM versions v "
+                "WHERE v.id > ? AND v.id <= ? AND NOT EXISTS ("
+                "  SELECT 1 FROM entries e WHERE e.version_id = v.id AND e.service = ?"
+                ")",
+                (after_version, to_version, service),
+            ).fetchone()
+        return int(row["missing"]) == 0
+
     @contextlib.contextmanager
     def read_view(self):
         """Pin one version for the lifetime of the context.
@@ -617,6 +656,15 @@ class DirectoryStore:
                 (new_version, svc, addr),
             )
             self._set_current(conn, new_version)
+        self._fire(
+            "after_version_commit",
+            {
+                "version": new_version,
+                "previous_version": previous,
+                "service": svc,
+                "kind": "upsert",
+            },
+        )
         return {
             "version": new_version,
             "previous_version": previous,
@@ -640,6 +688,15 @@ class DirectoryStore:
             if cur.rowcount == 0:
                 raise NotFoundError(f"未知服务: {svc}")
             self._set_current(conn, new_version)
+        self._fire(
+            "after_version_commit",
+            {
+                "version": new_version,
+                "previous_version": previous,
+                "service": svc,
+                "kind": "delete",
+            },
+        )
         return {
             "version": new_version,
             "previous_version": previous,
@@ -862,6 +919,15 @@ class DirectoryStore:
                 "entry_count": validated.entry_count,
                 "digest": validated.digest,
             }
+            self._fire(
+                "after_version_commit",
+                {
+                    "version": new_version,
+                    "previous_version": previous,
+                    "backup": backup_name,
+                    "kind": "restore",
+                },
+            )
             self._fire("after_restore_commit", result)
             return result
         except BaseException:

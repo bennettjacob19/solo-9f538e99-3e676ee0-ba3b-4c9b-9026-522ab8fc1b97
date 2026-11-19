@@ -8,9 +8,29 @@ services:
     environment:
       SVCDIR_DB: /data/directory.sqlite3
       SVCDIR_RESTORE_LEASE_SECONDS: "30"
+      SVCDIR_TARGETS_FILE: /data/metrics-targets.json
     volumes:
       - svcdir-data:/data
     restart: unless-stopped
 
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: svcdir-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # 只读挂载共享卷：svcdir 写入的 file_sd 目标文件在这里被读取。
+      - svcdir-data:/data:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+    depends_on:
+      - svcdir
+    restart: unless-stopped
+
 volumes:
   svcdir-data:
+  prometheus-data:

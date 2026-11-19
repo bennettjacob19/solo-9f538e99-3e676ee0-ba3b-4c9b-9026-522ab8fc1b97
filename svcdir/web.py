@@ -8,6 +8,7 @@ from pathlib import Path
 from flask import Flask, jsonify, redirect, render_template, request, url_for
 
 from .errors import DirectoryError, InputError
+from .publisher import TargetFilePublisher
 from .store import DirectoryStore
 
 
@@ -17,7 +18,19 @@ def _store_from_env() -> DirectoryStore:
     return DirectoryStore(db_path, restore_lease_seconds=lease)
 
 
-def create_app(store: DirectoryStore | None = None, *, config: dict | None = None) -> Flask:
+def _publisher_from_env(store: DirectoryStore) -> TargetFilePublisher:
+    path = os.environ.get("SVCDIR_TARGETS_FILE")
+    if not path:
+        path = str(Path(store.db_path).parent / "metrics-targets.json")
+    return TargetFilePublisher(store, path)
+
+
+def create_app(
+    store: DirectoryStore | None = None,
+    *,
+    config: dict | None = None,
+    publisher: TargetFilePublisher | None = None,
+) -> Flask:
     app = Flask(__name__)
     app.config.update(
         SVCDIR_TESTING=False,
@@ -29,7 +42,18 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
     app.json.sort_keys = False
     store = store or _store_from_env()
     app.extensions["svcdir"] = store
+    publisher = publisher or _publisher_from_env(store)
+    app.extensions["svcdir_publisher"] = publisher
+    # Every committed directory change republishes the whole target file from
+    # the new committed version.  Publishing never raises, so a failed publish
+    # leaves the directory change in effect and is retried later.
+    store.register_hook(
+        "after_version_commit",
+        lambda payload: publisher.publish(payload["version"]),
+    )
     store.initialize()
+    # 重启后按当前目录补发：启动时把当前已提交版本重新发布一次。
+    publisher.publish_current()
 
     @app.after_request
     def security_headers(response):
@@ -161,6 +185,35 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
         result = store.restore_backup(name)
         return jsonify({"ok": True, **result})
 
+    @app.get("/api/targets")
+    def api_targets():
+        return jsonify({"ok": True, "targets": publisher.status()})
+
+    @app.post("/api/targets/republish")
+    def api_republish_targets():
+        result = publisher.publish_current()
+        if not result.ok:
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "publish_failed",
+                            "message": f"目标文件发布失败：{result.error}",
+                        },
+                    }
+                ),
+                500,
+            )
+        return jsonify(
+            {
+                "ok": True,
+                "version": result.version,
+                "outcome": result.outcome,
+                "counts": result.counts,
+            }
+        )
+
     # -- HTML -------------------------------------------------------------
 
     def _redirect_back(**kwargs):
@@ -169,7 +222,8 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
     @app.get("/")
     def index():
         snapshot = store.snapshot()
-        return render_template("index.html", state=snapshot, message=request.args.get("message"),
+        return render_template("index.html", state=snapshot, targets=publisher.status(),
+                               message=request.args.get("message"),
                                error=request.args.get("error"))
 
     @app.post("/services")
@@ -211,6 +265,21 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
         return _redirect_back(
             message=f"已从备份 {result['backup']} 恢复：{result['entry_count']} 条，"
                     f"新目录版本 {result['new_version']}"
+        )
+
+    @app.post("/targets/republish")
+    def form_republish_targets():
+        result = publisher.publish_current()
+        if not result.ok:
+            return _redirect_back(error=f"目标文件发布失败：{result.error}")
+        if result.outcome == "stale":
+            return _redirect_back(message="目标文件已是最新版本，未覆盖。")
+        counts = result.counts
+        return _redirect_back(
+            message=f"已重发目标文件（目录版本 {result.version}）："
+                    f"{counts.get('published', 0)} 个目标，"
+                    f"{counts.get('reused', 0)} 个沿用，"
+                    f"{counts.get('skipped', 0)} 个跳过"
         )
 
     return app

@@ -4,6 +4,10 @@
 「服务名 → 目标地址」的映射、创建命名备份、并从一个备份恢复。另有 `/resolve`
 查询 API 供客户端使用。
 
+所有以 `metrics-` 开头的服务会自动发布为 Prometheus 的 file_sd 目标文件
+（默认 `metrics-targets.json`），每次目录变更提交后整份重建并原子替换，
+Prometheus 据此发现抓取目标，每个目标都带 `service` 标签。
+
 ## 启动
 
 ### Docker Compose（推荐）
@@ -15,8 +19,13 @@ docker compose up --build
 - 网页：<http://localhost:8000/>
 - API：`GET http://localhost:8000/resolve?name=orders-api`
 - 健康检查：`GET /healthz`
+- Prometheus：<http://localhost:9090/>，在 **Status → Targets** 页
+  （`job=svcdir-directory`）可核对 `metrics-` 目标的增删——在网页里新增、
+  改址或删除 `metrics-` 服务后，约 10 秒（`refresh_interval`）内目标随之上下架。
 - SQLite 数据与备份都位于命名卷 `svcdir-data` 的 `/data/directory.sqlite3`
   （备份是同一数据库里的版本快照，所以备份与恢复天然原子）。
+- file_sd 目标文件是同一卷上的 `/data/metrics-targets.json`：svcdir 容器写入，
+  Prometheus 容器只读挂载同一卷读取。
 
 ### 本地运行
 
@@ -32,13 +41,14 @@ SVCDIR_DB=./data/directory.sqlite3 python3 -m svcdir   # 开发用内置服务�
 | --- | --- | --- |
 | `SVCDIR_DB` | `data/directory.sqlite3` | SQLite 文件路径 |
 | `SVCDIR_RESTORE_LEASE_SECONDS` | `30` | 恢复租约时长（进程异常死亡后的兜底回收上限） |
+| `SVCDIR_TARGETS_FILE` | `<数据库目录>/metrics-targets.json` | Prometheus file_sd 目标文件路径 |
 | `PORT` | `8000` | 仅用于 `python -m svcdir` |
 
 ## 页面与 API
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/` | 网页：目录、修改表单、备份列表、恢复按钮 |
+| GET | `/` | 网页：目录、修改表单、目标文件状态、备份列表、恢复按钮 |
 | GET | `/resolve?name=<服务名>` | 返回单个服务的地址 |
 | GET | `/resolve` | 返回整个当前目录 |
 | GET | `/api/state` | 当前版本、完整目录、恢复状态、备份列表 |
@@ -48,9 +58,11 @@ SVCDIR_DB=./data/directory.sqlite3 python3 -m svcdir   # 开发用内置服务�
 | POST | `/api/backups` | `{"name": ...}` 创建命名备份 |
 | GET | `/api/backups/<名>/validate` | 校验备份（不修改目录） |
 | POST | `/api/backups/<名>/restore` | 从备份恢复 |
+| GET | `/api/targets` | 目标文件状态：文件版本、每个 `metrics-` 服务的目录地址/文件地址对照 |
+| POST | `/api/targets/republish` | 按当前目录版本手动重发目标文件 |
 
-浏览器表单走 `POST /services`、`/backups`、`/backups/<名>/restore`，
-成功后 303 跳回页面并显示结果或错误。
+浏览器表单走 `POST /services`、`/backups`、`/backups/<名>/restore`、
+`/targets/republish`，成功后 303 跳回页面并显示结果或错误。
 
 查询响应示例：
 
@@ -58,6 +70,40 @@ SVCDIR_DB=./data/directory.sqlite3 python3 -m svcdir   # 开发用内置服务�
 {"ok": true, "version": 6, "restore_in_progress": false,
  "name": "orders-api", "address": "10.0.0.12:8080"}
 ```
+
+## Prometheus 目标文件发布
+
+`svcdir/publisher.py` 在每次目录变更（新增、改址、删除、备份恢复）**提交后**，
+从该已提交的目录版本重新生成整份目标文件并原子替换（先写临时文件再
+`rename`，Prometheus 只会读到完整的新旧文件之一）。目标文件是标准的
+file_sd JSON：
+
+```json
+[
+  {"targets": ["10.0.0.12:8080"], "labels": {"service": "metrics-orders"}}
+]
+```
+
+逐条语义：
+
+- **只发布 `metrics-` 前缀的服务**，每个目标一组，带 `service=<服务名>` 标签。
+- **地址必须是 `host:port`**（支持 `[IPv6]:port`，端口 1–65535）。不符合的
+  服务不进文件，也**不影响其他目标**照常更新。
+- **沿用旧地址**：目录地址无效时，若该服务*从上次成功发布起在每一个目录
+  版本中都存在*，则沿用文件中已有的旧地址（文件版本记录在旁边的
+  `<目标文件>.version` 里，且版本文件总是最后写入，绝不会比内容更新）。
+  否则**跳过**该服务。
+- **删除必撤下**：删除提交后目标即从文件移除。即使删除与同名重建之间没
+  能发布文件（如发布失败），重建的服务也**不满足连续性条件**，不会沿用
+  旧地址——文件里的旧地址属于删除前的同一个名字，不代表新实例。
+- **发布失败保留原文件**：替换是原子的，失败时旧文件一个字节不动；目录
+  改动照常生效（发布器绝不向写路径抛异常），首页标记「待重发」，可点
+  「立即重发目标文件」手动重发；进程重启时也会按当前目录自动补发一次。
+- **迟到的发布不覆盖新版**：每次发布携带目录版本号，加锁后先比对文件
+  已反映的版本，旧版本发布直接丢弃。
+- 首页「Prometheus 目标文件」卡片并排展示每个 `metrics-` 服务的**目录
+  地址**与**文件中的实际地址**，并标注状态：`已发布` / `沿用` / `跳过`
+  / `待重发`。
 
 ## 一致性与恢复语义
 
@@ -112,24 +158,34 @@ python3 -m pytest -q
 - `test_api_flow` / `test_html_page_and_forms` / `test_html_escapes_hostile_names`
 - `test_api_validation_errors_are_json` / `test_edge_case_inputs_are_rejected_cleanly`
 
+目标文件发布覆盖在 `tests/test_publisher.py`：非法地址跳过、沿用/不可沿用、
+删除撤下、迟到发布不覆盖新版、发布失败保留原文件且目录改动照常、重启补发、
+手动重发与首页状态标注等。
+
 ## 布局
 
 ```
 svcdir/errors.py     错误类型 → HTTP 状态码
 svcdir/store.py      目录版本、命名备份、校验、恢复（核心逻辑）
+svcdir/publisher.py  Prometheus file_sd 目标文件发布器
 svcdir/web.py        Flask 路由：网页 + API
 svcdir/templates/    页面模板
-tests/test_svcdir.py 自测（含并发交错）
+prometheus/          Prometheus 抓取配置（file_sd）
+tests/test_svcdir.py    目录/备份/恢复自测（含并发交错）
+tests/test_publisher.py 目标文件发布自测
 Dockerfile / docker-compose.yml
 ```
 
 ## 已知限制与未完成项
 
 - **未在 Docker 中实际构建/运行。** 本环境没有 Docker（`docker` 命令不存在），
-  因此 Dockerfile 与 compose 文件只做了静态检查。应用本身已用
-  `python -m svcdir` 与 gunicorn 在真实 HTTP 上跑通。
+  因此 Dockerfile、compose 文件与 `prometheus/prometheus.yml` 只做了静态检查
+  （YAML 语法与路径交叉校验）。应用本身已用 `python -m svcdir` 与 gunicorn 在
+  真实 HTTP 上跑通，目标文件的增删、沿用/跳过、失败保留、重启补发均有自动化
+  测试覆盖。
 - 单容器部署，恢复互斥依赖同一文件系统上的 `flock`；若把数据目录放到不支持
-  `flock` 的网络文件系统，会退化为「租约到期才算失效」。
+  `flock` 的网络文件系统，会退化为「租约到期才算失效」。目标文件发布的跨进程
+  互斥同理（同进程内由线程锁保证）。
 - 备份保存在同一 SQLite 数据库中，可防止误改目录，但不能防磁盘/文件损坏；
   需要异地容灾应另行导出备份文件。
 - 未做用户认证与 HTTPS——按需求这是本地运维工具，请只在内网使用。
